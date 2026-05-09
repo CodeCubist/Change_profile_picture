@@ -1,7 +1,10 @@
 #include <exception>
 #include <format>
 #include <filesystem>
+#include <vector>
 #include <span>
+#include <ranges>
+#include <charconv>
 #include <Windows.h>
 #include <gdiplus.h>
 #include <commdlg.h>
@@ -18,50 +21,56 @@ template <class Func, class T> struct scope_exit {
 };
 
 
-auto load_texture(const wchar_t* file_path, const int texture_size) -> std::vector<uint8_t> {
+auto load_texture(const wchar_t* file_path, const std::span<int> sizes) -> std::vector<std::pair<std::vector<uint8_t>, uint64_t>> {
     Gdiplus::GdiplusStartupInput gdiplus_startup_input;
     ULONG_PTR gdiplus_token;
 
     Gdiplus::GdiplusStartup(&gdiplus_token, &gdiplus_startup_input, nullptr);
     scope_exit auto_shutdown_gdi(Gdiplus::GdiplusShutdown, gdiplus_token);
 
-    auto origin_texture = Gdiplus::Bitmap(file_path);
-    if (origin_texture.GetLastStatus() != Gdiplus::Ok)
+    auto origin_bmp = Gdiplus::Bitmap(file_path);
+    if (origin_bmp.GetLastStatus() != Gdiplus::Ok)
         throw std::runtime_error("Failed to Load Image File");
 
-    auto texture = Gdiplus::Bitmap(texture_size, texture_size, PixelFormat32bppARGB);
-    auto graphics = Gdiplus::Graphics(&texture);
+    auto textures = std::vector<std::pair<std::vector<uint8_t>, uint64_t>>();
 
-    graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    graphics.Clear(Gdiplus::Color::Transparent);
+    for (int texture_size : sizes) {
+        auto bmp = Gdiplus::Bitmap(texture_size, texture_size, PixelFormat32bppARGB);
+        auto graphics = Gdiplus::Graphics(&bmp);
 
-    Gdiplus::GraphicsPath path;
-    path.AddEllipse(0, 0, texture_size, texture_size);
-    graphics.SetClip(&path);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        graphics.Clear(Gdiplus::Color::Transparent);
 
-    graphics.TranslateTransform(0, (Gdiplus::REAL)texture_size);
-    graphics.ScaleTransform(1.0f, -1.0f);
-    graphics.DrawImage(&origin_texture, 0, 0, texture_size, texture_size);
+        Gdiplus::GraphicsPath path;
+        path.AddEllipse(0, 0, texture_size, texture_size);
+        graphics.SetClip(&path);
 
-    auto rect = Gdiplus::Rect(0, 0, texture_size, texture_size);
-    Gdiplus::BitmapData bmp_data;
+        graphics.TranslateTransform(0, (Gdiplus::REAL)texture_size);
+        graphics.ScaleTransform(1.0f, -1.0f);
+        graphics.DrawImage(&origin_bmp, 0, 0, texture_size, texture_size);
 
-    if (texture.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bmp_data) != Gdiplus::Ok)
-        throw std::runtime_error("Failed to Lock bits");
-    
-    std::vector<uint8_t> result(texture_size * texture_size * 4);
-    const uint8_t* __restrict src = (uint8_t*)bmp_data.Scan0;
-    for (int i = 0; i < texture_size * texture_size * 4; i += 4) {
-        result[i + 0] = src[i + 2];
-        result[i + 1] = src[i + 1];
-        result[i + 2] = src[i + 0];
-        result[i + 3] = src[i + 3];
+        auto rect = Gdiplus::Rect(0, 0, texture_size, texture_size);
+        Gdiplus::BitmapData bmp_data;
+
+        if (bmp.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bmp_data) != Gdiplus::Ok)
+            throw std::runtime_error("Failed to Lock bits");
+        
+        std::vector<uint8_t> texture(texture_size * texture_size * 4);
+        const uint8_t* __restrict src = (uint8_t*)bmp_data.Scan0;
+        for (int i = 0; i < texture_size * texture_size * 4; i += 4) {
+            texture[i + 0] = src[i + 2];
+            texture[i + 1] = src[i + 1];
+            texture[i + 2] = src[i + 0];
+            texture[i + 3] = src[i + 3];
+        }
+
+        bmp.UnlockBits(&bmp_data);
+        textures.emplace_back(std::move(texture), uint64_t(texture_size));
     }
 
-    texture.UnlockBits(&bmp_data);
-    return result;
+    return textures;
 }
 
 
@@ -92,10 +101,10 @@ auto open_file_picker(const wchar_t* filter, const std::filesystem::path& initia
 }
 
 
-void start_texdbg_pipe(const std::span<uint8_t> data, int texture_size) {
+void start_texdbg_pipe(const std::vector<std::pair<std::vector<uint8_t>, uint64_t>>& textures) {
     constexpr char pipe_name[] = "\\\\.\\pipe\\D3D11_TexDbg_SharedBuffer";
 
-    HANDLE pipe = CreateNamedPipeA(pipe_name, PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 1, data.size() + 4, 0, 0, NULL);
+    HANDLE pipe = CreateNamedPipeA(pipe_name, PIPE_ACCESS_OUTBOUND, PIPE_TYPE_BYTE | PIPE_WAIT, 1, 0, 0, 0, NULL);
     if (pipe == INVALID_HANDLE_VALUE)
         throw std::runtime_error(std::format("Failed to Create Named Pipe '{}{}{}'", ansi::blue, pipe_name, ansi::reset));
 
@@ -104,17 +113,31 @@ void start_texdbg_pipe(const std::span<uint8_t> data, int texture_size) {
     if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
         throw std::runtime_error(std::format("Failed to Connect to Named Pipe '{}{}{}'", ansi::blue, pipe_name, ansi::reset));
 
-    DWORD written;
-    WriteFile(pipe, &texture_size, sizeof(texture_size), &written, nullptr);
-    WriteFile(pipe, data.data(), data.size(), &written, nullptr);
+    DWORD written = 0;
+    int64_t textures_count = textures.size();
+    WriteFile(pipe, &textures_count, sizeof(textures_count), &written, nullptr);
+
+    for (auto& [texture, texture_size] : textures) {
+        WriteFile(pipe, &texture_size, sizeof(texture_size), &written, nullptr);
+        WriteFile(pipe, texture.data(), texture.size(), &written, nullptr);
+    }
 }
+
+
+auto convert_to_int = std::views::transform([](std::ranges::viewable_range auto&& r) {
+    int value = 0;
+    auto [ptr, ec] = std::from_chars(r.data(), r.data() + r.size(), value);
+    if (ec != std::errc())
+        throw std::runtime_error(std::format("Cannot convert '{}' to int", std::string_view(r)));
+    return value;
+});
 
 
 auto main(int argc, char* argv[]) -> int try {
     console::init();
     auto args = cmdline::parse(argc, argv);
 
-    int texture_size = args["--texture_size"] | args["-s"] | 512;
+    std::vector<int> sizes = args["--sizes"] | "512,256,128" | std::views::split(',') | convert_to_int | std::ranges::to<std::vector<int>>();
     std::string module_path = args["--module"] | args["-m"] | "dx11_texture_debugger.dll";
     std::string target_process_name = args["--target"] | args["-t"] | "";
 
@@ -129,7 +152,8 @@ auto main(int argc, char* argv[]) -> int try {
     console::info("Successfully Load '{}{}{}'", ansi::blue, module_path, ansi::reset);
 
     std::wstring texture_file = open_file_picker(L"Image Files\0*.jpg;*.jpeg;*.png;*.bmp\0All Files\0*.*\0");
-    std::vector<uint8_t> texture = load_texture(texture_file.c_str(), texture_size);
+
+    auto textures = load_texture(texture_file.c_str(), sizes);
     console::info("Successfully Load Debug Texture Image");
 
     auto func_hook_proc = get_module_func<HOOKPROC>(module, "hook_proc");
@@ -145,7 +169,7 @@ auto main(int argc, char* argv[]) -> int try {
     console::info("Successfully Set Windows Hook");
     
     console::info("Waiting for the Texture data to be taken by Target...");
-    start_texdbg_pipe(texture, texture_size);
+    start_texdbg_pipe(textures);
     console::info("Texture data was Successfully taken by Target");
 
     console::info("Press {}Enter{} to Exit...", ansi::blue, ansi::reset);

@@ -1,4 +1,6 @@
 #include <thread>
+#include <unordered_map>
+#include <vector>
 #include <cstring>
 #include <Windows.h>
 #include <d3d11.h>
@@ -19,8 +21,7 @@
 #endif
 
 bool is_hooked = false;
-uint8_t* __restrict debug_texture_data = nullptr;
-unsigned texture_size = 0;
+std::unordered_map<uint64_t, std::vector<uint8_t>> debug_textures;
 
 HRESULT(WINAPI *origin_func_Map)(ID3D11DeviceContext*,ID3D11Resource*,UINT,D3D11_MAP,UINT,D3D11_MAPPED_SUBRESOURCE*) = nullptr;
 
@@ -41,7 +42,7 @@ bool varify_process_name() {
 }
 
 
-bool fetch_dbgtex_via_pipe() {
+bool fetch_debug_textures_via_pipe() {
     constexpr char pipe_name[] = "\\\\.\\pipe\\D3D11_TexDbg_SharedBuffer";
 
     HANDLE pipe = CreateFileA(pipe_name, GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -49,11 +50,23 @@ bool fetch_dbgtex_via_pipe() {
     if (pipe == INVALID_HANDLE_VALUE) 
         return false;
 
-    DWORD bytes_read;
-    ReadFile(pipe, &texture_size, sizeof(texture_size), &bytes_read, nullptr);
+    DWORD bytes_read = 0;
 
-    debug_texture_data = new uint8_t[texture_size * texture_size * 4];
-    ReadFile(pipe, debug_texture_data, texture_size * texture_size * 4, &bytes_read, nullptr);
+	int64_t textures_count = 0;
+	if (!ReadFile(pipe, &textures_count, sizeof(textures_count), &bytes_read, nullptr)) {
+        CloseHandle(pipe);
+        return false;
+    }
+
+    for (int i = 0; i < textures_count; i++) {
+        uint64_t texture_size = 0;
+        ReadFile(pipe, &texture_size, sizeof(texture_size), &bytes_read, nullptr);
+        
+		std::vector<uint8_t> buffer(texture_size * texture_size * 4);
+        ReadFile(pipe, buffer.data(), buffer.size(), &bytes_read, nullptr);
+        
+        debug_textures[texture_size] = std::move(buffer);
+    }
 
     CloseHandle(pipe);
     return true;
@@ -63,32 +76,36 @@ bool fetch_dbgtex_via_pipe() {
 HRESULT WINAPI hooked_Map(ID3D11DeviceContext* _this, ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE *pMappedResource) {
     HRESULT hr = origin_func_Map(_this, pResource, Subresource, MapType, MapFlags, pMappedResource);
     
-	if (FAILED(hr)) 
-		return hr;
+    if (FAILED(hr)) 
+        return hr;
 
-	if (MapType != D3D11_MAP_READ && MapType != D3D11_MAP_READ_WRITE)
-		return hr;
+    if (MapType != D3D11_MAP_READ && MapType != D3D11_MAP_READ_WRITE)
+        return hr;
 
-	ID3D11Texture2D* d3d_texture = nullptr;
+    ID3D11Texture2D* d3d_texture = nullptr;
+    if (FAILED(pResource->QueryInterface(IID_ID3D11Texture2D, (void**)&d3d_texture)))
+        return hr;
 
-	if (FAILED(pResource->QueryInterface(IID_ID3D11Texture2D, (void**)&d3d_texture)))
-		return hr;
+    D3D11_TEXTURE2D_DESC desc;
+    d3d_texture->GetDesc(&desc);
+    d3d_texture->Release();
 
-	D3D11_TEXTURE2D_DESC desc;
-	d3d_texture->GetDesc(&desc);
-	d3d_texture->Release();
+    if (desc.Usage == D3D11_USAGE_STAGING && desc.Width == desc.Height) {
+        if (desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
 
-	if (desc.Usage == D3D11_USAGE_STAGING && 
-		desc.Width == texture_size && desc.Height == texture_size && 
-		desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
-		pMappedResource->RowPitch == texture_size * 4
-	) {
-		std::memcpy(pMappedResource->pData, debug_texture_data, texture_size * texture_size * 4);
-	}
+            if (auto it = debug_textures.find(desc.Width); it != debug_textures.end()) {
+                uint8_t* __restrict dst = static_cast<uint8_t*>(pMappedResource->pData);
+                const uint8_t* __restrict src = it->second.data();
+                unsigned row_size = desc.Width * 4;
+
+                for (unsigned y = 0; y < desc.Height; y++)
+                    std::memcpy(dst + y * pMappedResource->RowPitch, src + y * row_size, row_size);
+            }
+        }
+    }
 
     return hr;
 }
-
 
 void hook() {
 	D3D_FEATURE_LEVEL levels[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
@@ -111,18 +128,15 @@ void hook() {
 		return;
 	}
 
-	if (!fetch_dbgtex_via_pipe()) {
+	if (!fetch_debug_textures_via_pipe()) {
         MessageBoxA(nullptr, "Error in hook(): Faild to fetch Texture data", "Error", MB_OK | MB_ICONERROR);
 		return;
     }
 
-	auto context_vtable_ptr = (void***)d3d_context;
-	auto context_vtable = *context_vtable_ptr;
-
-	auto func_map = context_vtable[14];
+	auto context_vtable = *(void***)d3d_context;
 
 	MH_Initialize();
-	MH_CreateHook(func_map, (void*)hooked_Map, (void**)&origin_func_Map);
+	MH_CreateHook(context_vtable[14], (void*)hooked_Map, (void**)&origin_func_Map);
 	MH_EnableHook(MH_ALL_HOOKS);
 
 	d3d_device->Release();
@@ -137,7 +151,7 @@ void unhook() {
 	MH_DisableHook(MH_ALL_HOOKS);
 	std::this_thread::sleep_for(std::chrono::milliseconds(150));
 	MH_Uninitialize();
-	delete[] debug_texture_data;
+    debug_textures.clear();
 	is_hooked = false;
 }
 
