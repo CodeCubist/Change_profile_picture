@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Release" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="Plugin_avatar/Plugin_avatar.vcxproj">
+    <Configuration Solution="Release|x64" Project="Release|x64|Deploy" />
+  </Project>
+</Solution>
