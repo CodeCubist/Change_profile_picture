@@ -7,6 +7,10 @@
 #include <thread>
 #include <cstring>
 #include <cstdio>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
+#include <chrono>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxguid.lib")
@@ -18,6 +22,10 @@ bool g_is_hooked = false;
 ULONG_PTR g_gdiplus_token;
 std::unordered_map<uint64_t, std::vector<uint8_t>> debug_textures;
 std::unordered_map<uint64_t, bool> notified_sizes;
+
+std::shared_mutex g_texture_mutex;
+std::atomic g_monitor_running{ false };
+std::thread g_monitor_thread;
 
 HRESULT(WINAPI* origin_func_Map)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*) = nullptr;
 
@@ -54,7 +62,8 @@ HRESULT WINAPI hooked_Map(ID3D11DeviceContext* _this, ID3D11Resource* pResource,
 
     if (desc.Usage == D3D11_USAGE_STAGING && desc.Width == desc.Height) {
         if (desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-
+            
+            std::shared_lock<std::shared_mutex> lock(g_texture_mutex);
             if (auto it = debug_textures.find(desc.Width); it != debug_textures.end()) {
                 uint8_t* __restrict dst = static_cast<uint8_t*>(pMappedResource->pData);
                 const uint8_t* __restrict src = it->second.data();
@@ -88,13 +97,6 @@ bool get_image_path(wchar_t* out_path, size_t max_len) {
 }
 
 bool load_target_texture() {
-    printf("[Process] Initializing GDI+...\n");
-    Gdiplus::GdiplusStartupInput gdiplus_startup_input;
-    if (Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdiplus_startup_input, nullptr) != Gdiplus::Ok) {
-        printf("[Error] Failed to initialize GDI+.\n");
-        return false;
-    }
-
     wchar_t image_path[MAX_PATH] = { 0 };
     if (!get_image_path(image_path, MAX_PATH)) {
         printf("[Error] Failed to get module path.\n");
@@ -110,6 +112,8 @@ bool load_target_texture() {
 
     std::vector<int> sizes = { 1024, 512, 256, 128, 64 };
     printf("[Process] Generating target textures...\n");
+
+    std::unordered_map<uint64_t, std::vector<uint8_t>> new_textures;
 
     for (int texture_size : sizes) {
         Gdiplus::Bitmap bmp(texture_size, texture_size, PixelFormat32bppARGB);
@@ -145,17 +149,62 @@ bool load_target_texture() {
         }
 
         bmp.UnlockBits(&bmp_data);
-        debug_textures[texture_size] = std::move(texture);
+        new_textures[texture_size] = std::move(texture);
         printf("[Process] Texture generated: %dx%d\n", texture_size, texture_size);
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(g_texture_mutex);
+        debug_textures = std::move(new_textures);
+        notified_sizes.clear();
     }
 
     printf("[Success] Image loading and processing completed.\n");
     return true;
 }
 
+FILETIME get_file_write_time(const wchar_t* path) {
+    FILETIME ft = { 0 };
+    WIN32_FILE_ATTRIBUTE_DATA fileInfo;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fileInfo)) {
+        ft = fileInfo.ftLastWriteTime;
+    }
+    return ft;
+}
+
+void monitor_file_thread() {
+    wchar_t image_path[MAX_PATH] = { 0 };
+    if (!get_image_path(image_path, MAX_PATH)) return;
+
+    FILETIME last_write_time = get_file_write_time(image_path);
+
+    while (g_monitor_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        FILETIME current_write_time = get_file_write_time(image_path);
+
+        if (CompareFileTime(&last_write_time, &current_write_time) != 0) {
+            printf("[Info] File change detected: avatar.png. Reloading...\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200)); 
+            if (load_target_texture()) {
+                last_write_time = current_write_time;
+            }
+        }
+    }
+}
+
 void init_hook() {
+    printf("[Process] Initializing GDI+...\n");
+    Gdiplus::GdiplusStartupInput gdiplus_startup_input;
+    if (Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdiplus_startup_input, nullptr) != Gdiplus::Ok) {
+        printf("[Error] Failed to initialize GDI+.\n");
+        return;
+    }
+
     if (!load_target_texture())
         return;
+
+    g_monitor_running = true;
+    g_monitor_thread = std::thread(monitor_file_thread);
 
     printf("[Process] Initializing D3D11 Hook...\n");
     HWND hwnd = GetForegroundWindow();
@@ -196,6 +245,11 @@ void init_hook() {
 }
 
 void unhook() {
+    g_monitor_running = false;
+    if (g_monitor_thread.joinable()) {
+        g_monitor_thread.join();
+    }
+
     if (g_is_hooked) {
         printf("[Process] Disabling hooks...\n");
         MH_DisableHook(MH_ALL_HOOKS);
@@ -204,8 +258,11 @@ void unhook() {
         g_is_hooked = false;
     }
     
-    debug_textures.clear();
-    notified_sizes.clear();
+    {
+        std::unique_lock lock(g_texture_mutex);
+        debug_textures.clear();
+        notified_sizes.clear();
+    }
     Gdiplus::GdiplusShutdown(g_gdiplus_token);
 }
 
