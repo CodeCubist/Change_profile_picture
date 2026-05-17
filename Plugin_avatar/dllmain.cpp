@@ -29,20 +29,6 @@ std::thread g_monitor_thread;
 
 HRESULT(WINAPI* origin_func_Map)(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*) = nullptr;
 
-void init_console() {
-    AllocConsole();
-    FILE* fDummy;
-    freopen_s(&fDummy, "CONOUT$", "w", stdout);
-    freopen_s(&fDummy, "CONIN$", "r", stdin);
-    SetConsoleTitleW(L"Avatar Plugin Status Console");
-    printf("[Info] Console allocated successfully.\n");
-}
-
-void free_console() {
-    printf("[Info] Freeing console and exiting...\n");
-    FreeConsole();
-}
-
 HRESULT WINAPI hooked_Map(ID3D11DeviceContext* _this, ID3D11Resource* pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource) {
     HRESULT hr = origin_func_Map(_this, pResource, Subresource, MapType, MapFlags, pMappedResource);
 
@@ -267,23 +253,21 @@ void unhook() {
 }
 
 DWORD WINAPI MainThread(LPVOID lpReserved) {
-    init_console();
     init_hook();
     return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason_for_call, LPVOID lpReserved) {
     switch (reason_for_call) {
-        case DLL_PROCESS_ATTACH:
-            DisableThreadLibraryCalls(hModule);
-            g_hModule = hModule;
-            CloseHandle(CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr));
-            break;
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hModule);
+        g_hModule = hModule;
+        CloseHandle(CreateThread(nullptr, 0, MainThread, hModule, 0, nullptr));
+        break;
 
-        case DLL_PROCESS_DETACH:
-            unhook();
-            free_console();
-            break;
+    case DLL_PROCESS_DETACH:
+        unhook();
+        break;
     }
     return TRUE;
 }
