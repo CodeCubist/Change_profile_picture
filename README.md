@@ -1,7 +1,4 @@
 # Change_profile_picture
 
-## [香草味的纳西妲喵](https://t.bilibili.com/1205131303202062358)R.I.P
-
-<img width="1052" height="457" alt="image" src="https://github.com/user-attachments/assets/41be4854-6cfb-43bd-bbde-cb06f1a16b72" />
-<img width="1052" height="872" alt="image" src="https://github.com/user-attachments/assets/39e478e6-84f3-428d-b1ac-c3217a27469b" />
-<img width="1052" height="874" alt="image" src="https://github.com/user-attachments/assets/c0737a73-25fb-46fe-89ce-cae10782f967" />
+All actions taken by users while using this software and during the process of obtaining developer permissions, as well as any consequences arising from such actions (including but not limited to legal risks and breach of contract liabilities), are entirely borne by the users themselves. The developers of this software strictly prohibit the use of this software for any actions that violate applicable laws and regulations, undermine the fairness of games, violate third-party service terms (TOS), or infringe upon the legitimate rights of third parties. 
+If users engage in any improper, non-compliant, or illegal activities using this software, such actions are solely at the users' own discretion and independent operation, and have no connection with the software or its developers. The developers strongly condemn such behavior and do not assume any direct or joint legal or financial responsibility for any improper actions of the users.
